@@ -202,11 +202,11 @@ func (t *TricksterHandler) promQueryRangeHandler(w http.ResponseWriter, r *http.
 // Helper functions
 
 // defaultPrometheusMatrixEnvelope returns an empty envelope
-func defaultPrometheusMatrixEnvelope() PrometheusMatrixEnvelope {
-	return PrometheusMatrixEnvelope{
-		Data: PrometheusMatrixData{
+func defaultPrometheusMatrixEnvelope() PrometheusEnvelope {
+	return PrometheusEnvelope{
+		Data: PrometheusData{
 			ResultType: rvMatrix,
-			Result:     make([]*model.SampleStream, 0),
+			Result:     model.Matrix(make([]*model.SampleStream, 0)),
 		},
 	}
 }
@@ -306,8 +306,9 @@ func (t *TricksterHandler) getURL(method string, uri string, params url.Values, 
 	return body, resp, duration, nil
 }
 
-func (t *TricksterHandler) getVectorFromPrometheus(url string, params url.Values, r *http.Request) (PrometheusVectorEnvelope, *http.Response, error) {
-	pe := PrometheusVectorEnvelope{}
+// TODO: consolidate with getMatrixFromPrometheus
+func (t *TricksterHandler) getVectorFromPrometheus(url string, params url.Values, r *http.Request) (PrometheusEnvelope, *http.Response, error) {
+	pe := PrometheusEnvelope{}
 
 	// Make the HTTP Request
 	body, resp, err := t.fetchPromQuery(url, params, r)
@@ -323,8 +324,8 @@ func (t *TricksterHandler) getVectorFromPrometheus(url string, params url.Values
 	return pe, resp, nil
 }
 
-func (t *TricksterHandler) getMatrixFromPrometheus(url string, params url.Values, r *http.Request) (PrometheusMatrixEnvelope, *http.Response, time.Duration, error) {
-	pe := PrometheusMatrixEnvelope{}
+func (t *TricksterHandler) getMatrixFromPrometheus(url string, params url.Values, r *http.Request) (PrometheusEnvelope, *http.Response, time.Duration, error) {
+	pe := PrometheusEnvelope{}
 
 	// Make the HTTP Request - don't use fetchPromQuery here, that is for instantaneous only.
 	body, resp, duration, err := t.getURL(hmGet, url, params, getProxyableClientHeaders(r))
@@ -608,7 +609,7 @@ func (t *TricksterHandler) respondToCacheHit(ctx *ClientRequestContext) {
 		}
 		r = resp
 		if resp.StatusCode == 200 && ffd.Status == rvSuccess {
-			ctx.Matrix = t.mergeVector(ctx.Matrix, ffd)
+			ctx.Matrix = t.mergeEnvelope(ctx.Matrix, ffd)
 		}
 	}
 
@@ -673,9 +674,9 @@ func (t *TricksterHandler) originRangeProxyHandler(cacheKey string, originRangeR
 		} else {
 
 			// Now we know if we need to make any calls to the Origin, lets set those up
-			upperDeltaData := PrometheusMatrixEnvelope{}
-			lowerDeltaData := PrometheusMatrixEnvelope{}
-			fastForwardData := PrometheusVectorEnvelope{}
+			upperDeltaData := PrometheusEnvelope{}
+			lowerDeltaData := PrometheusEnvelope{}
+			fastForwardData := PrometheusEnvelope{}
 
 			var wg sync.WaitGroup
 
@@ -803,12 +804,12 @@ func (t *TricksterHandler) originRangeProxyHandler(cacheKey string, originRangeR
 
 			if lowerDeltaData.Status == rvSuccess {
 				uncachedElementCnt += lowerDeltaData.getValueCount()
-				ctx.Matrix = t.mergeMatrix(ctx.Matrix, lowerDeltaData)
+				ctx.Matrix = t.mergeEnvelope(ctx.Matrix, lowerDeltaData)
 			}
 
 			if upperDeltaData.Status == rvSuccess {
 				uncachedElementCnt += upperDeltaData.getValueCount()
-				ctx.Matrix = t.mergeMatrix(upperDeltaData, ctx.Matrix)
+				ctx.Matrix = t.mergeEnvelope(upperDeltaData, ctx.Matrix)
 			}
 
 			// Prune any old points based on retention policy
@@ -855,7 +856,7 @@ func (t *TricksterHandler) originRangeProxyHandler(cacheKey string, originRangeR
 
 			// Stictch in Fast Forward Data
 			if fastForwardData.Status == rvSuccess {
-				ctx.Matrix = t.mergeVector(ctx.Matrix, fastForwardData)
+				ctx.Matrix = t.mergeEnvelope(ctx.Matrix, fastForwardData)
 			}
 
 			// Marshal the Envelope back to a json object for User Response)
@@ -898,28 +899,61 @@ func alignStepBoundaries(start int64, end int64, stepMS int64, now int64) (int64
 	return start, end
 }
 
-func (pe PrometheusMatrixEnvelope) getValueCount() int64 {
-	i := int64(0)
-	for j := range pe.Data.Result {
-		i += int64(len(pe.Data.Result[j].Values))
+func (pe PrometheusEnvelope) getValueCount() int64 {
+	switch result := pe.Data.Result.(type) {
+	case model.Matrix:
+		i := int64(0)
+		for _, stream := range result {
+			i += int64(len(stream.Values))
+		}
+		return i
+	default:
+		panic("unknown")
 	}
-	return i
+}
+
+func (t *TricksterHandler) mergeEnvelope(pe PrometheusEnvelope, pv PrometheusEnvelope) PrometheusEnvelope {
+	peMatrix, ok := pe.Data.Result.(model.Matrix)
+	if !ok {
+		panic("nope")
+	}
+
+	switch pvTyped := pv.Data.Result.(type) {
+	case *model.Scalar:
+		pe.Data.Result = t.mergeScalar(peMatrix, pvTyped)
+	case model.Vector:
+		pe.Data.Result = t.mergeVector(peMatrix, pvTyped)
+	case model.Matrix:
+		pe.Data.Result = t.mergeMatrix(peMatrix, pvTyped)
+	default:
+		panic("nope")
+	}
+
+	return pe
 }
 
 // mergeVector merges the passed PrometheusVectorEnvelope object with the calling PrometheusVectorEnvelope object
-func (t *TricksterHandler) mergeVector(pe PrometheusMatrixEnvelope, pv PrometheusVectorEnvelope) PrometheusMatrixEnvelope {
-	if len(pv.Data.Result) == 0 {
-		level.Debug(t.Logger).Log(lfEvent, "mergeVectorPrematureExit")
-		return pe
+func (t *TricksterHandler) mergeScalar(peMatrix model.Matrix, pvScalar *model.Scalar) model.Matrix {
+	if len(peMatrix) > 1 {
+		panic("nope")
+	}
+	if pvScalar.Timestamp > peMatrix[0].Values[len(peMatrix[0].Values)-1].Timestamp {
+		peMatrix[0].Values = append(peMatrix[0].Values, model.SamplePair{
+			Timestamp: model.Time((int64(pvScalar.Timestamp) / 1000) * 1000),
+			Value:     pvScalar.Value,
+		})
 	}
 
-	for i := range pv.Data.Result {
-		result2 := pv.Data.Result[i]
-		for j := range pe.Data.Result {
-			result1 := pe.Data.Result[j]
+	return peMatrix
+}
+
+// mergeVector merges the passed PrometheusVectorEnvelope object with the calling PrometheusVectorEnvelope object
+func (t *TricksterHandler) mergeVector(peMatrix model.Matrix, pvVector model.Vector) model.Matrix {
+	for _, result2 := range pvVector {
+		for j, result1 := range peMatrix {
 			if result2.Metric.Equal(result1.Metric) {
 				if result2.Timestamp > result1.Values[len(result1.Values)-1].Timestamp {
-					pe.Data.Result[j].Values = append(pe.Data.Result[j].Values, model.SamplePair{
+					peMatrix[j].Values = append(peMatrix[j].Values, model.SamplePair{
 						Timestamp: model.Time((int64(result2.Timestamp) / 1000) * 1000),
 						Value:     result2.Value,
 					})
@@ -928,26 +962,17 @@ func (t *TricksterHandler) mergeVector(pe PrometheusMatrixEnvelope, pv Prometheu
 		}
 	}
 
-	return pe
+	return peMatrix
 }
 
 // mergeMatrix merges the passed PrometheusMatrixEnvelope object with the calling PrometheusMatrixEnvelope object
-func (t *TricksterHandler) mergeMatrix(pe PrometheusMatrixEnvelope, pe2 PrometheusMatrixEnvelope) PrometheusMatrixEnvelope {
-	if pe.Status != rvSuccess {
-		pe = pe2
-		return pe2
-	} else if pe2.Status != rvSuccess {
-		return pe
-	}
-
-	for i := range pe2.Data.Result {
+func (t *TricksterHandler) mergeMatrix(peMatrix model.Matrix, pe2Matrix model.Matrix) model.Matrix {
+	for i, result2 := range pe2Matrix {
 		metricSetFound := false
-		result2 := pe2.Data.Result[i]
-		for j := range pe.Data.Result {
-			result1 := pe.Data.Result[j]
+		for j, result1 := range peMatrix {
 			if result2.Metric.Equal(result1.Metric) {
 				metricSetFound = true
-				pe.Data.Result[j].Values = append(pe2.Data.Result[i].Values, pe.Data.Result[j].Values...)
+				peMatrix[j].Values = append(pe2Matrix[i].Values, peMatrix[j].Values...)
 				break
 			}
 		}
@@ -956,26 +981,30 @@ func (t *TricksterHandler) mergeMatrix(pe PrometheusMatrixEnvelope, pe2 Promethe
 			level.Debug(t.Logger).Log(lfEvent, "MergeMatrixEnvelopeNewMetric", lfDetail, "Did not find mergeable metric set in cache", "metricFingerprint", result2.Metric.Fingerprint())
 			// Couldn't find metrics with that name in the existing resultset, so this must
 			// be new for this poll. That's fine, just add it outright instead of merging.
-			pe.Data.Result = append(pe.Data.Result, result2)
+			peMatrix = append(peMatrix, result2)
 		}
 	}
 
-	return pe
+	return peMatrix
 }
 
 // cropToRange crops the datasets in a given PrometheusMatrixEnvelope down to the provided start and end times
-func (pe PrometheusMatrixEnvelope) cropToRange(start int64, end int64) {
+func (pe PrometheusEnvelope) cropToRange(start int64, end int64) {
+	matrix, ok := pe.Data.Result.(model.Matrix)
+	if !ok {
+		panic("nope")
+	}
 	// iterate through each metric series in the result
-	for i := range pe.Data.Result {
+	for i := range matrix {
 		if start > 0 {
 			// Now we First determine the correct start index for each series in the Matrix
 			// iterate through each value in the given metric series
-			for j := range pe.Data.Result[i].Values {
+			for j := range matrix[i].Values {
 				// If the timestamp for this data point is at or after the client requested start time,
 				// update the slice and break the loop.
-				ts := int64(pe.Data.Result[i].Values[j].Timestamp)
+				ts := int64(matrix[i].Values[j].Timestamp)
 				if ts >= start {
-					pe.Data.Result[i].Values = pe.Data.Result[i].Values[j:]
+					matrix[i].Values = matrix[i].Values[j:]
 					break
 				}
 			}
@@ -984,12 +1013,12 @@ func (pe PrometheusMatrixEnvelope) cropToRange(start int64, end int64) {
 		if end > 0 {
 			// Then we determine the correct end index for each series in the Matrix
 			// iterate *backwards* through each value in the given metric series
-			for j := len(pe.Data.Result[i].Values) - 1; j >= 0; j-- {
+			for j := len(matrix[i].Values) - 1; j >= 0; j-- {
 				// If the timestamp of this metric is at or after the client requested start time,
 				// update the offset and break.
-				ts := int64(pe.Data.Result[i].Values[j].Timestamp)
+				ts := int64(matrix[i].Values[j].Timestamp)
 				if ts <= end {
-					pe.Data.Result[i].Values = pe.Data.Result[i].Values[:j+1]
+					matrix[i].Values = matrix[i].Values[:j+1]
 					break
 				}
 			}
@@ -998,8 +1027,11 @@ func (pe PrometheusMatrixEnvelope) cropToRange(start int64, end int64) {
 }
 
 // getCacheExtents returns the timestamps of the oldest and newest cached data points for the given query.
-func (pe PrometheusMatrixEnvelope) getExtents() MatrixExtents {
-	r := pe.Data.Result
+func (pe PrometheusEnvelope) getExtents() MatrixExtents {
+	r, ok := pe.Data.Result.(model.Matrix)
+	if !ok {
+		panic("nope")
+	}
 
 	var oldest int64
 	var newest int64

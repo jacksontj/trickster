@@ -14,6 +14,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
@@ -21,6 +23,61 @@ import (
 	"github.com/prometheus/common/model"
 )
 
+type PrometheusEnvelope struct {
+	Status string         `json:"status"`
+	Data   PrometheusData `json:"data"`
+}
+
+type PrometheusData struct {
+	ResultType string      `json:"resultType"`
+	Result     model.Value `json:"result"`
+}
+
+func (d *PrometheusData) UnmarshalJSON(data []byte) error {
+	type Raw struct {
+		ResultType model.ValueType  `json:"resultType"`
+		Result     *json.RawMessage `json:"result"`
+	}
+	rawData := &Raw{}
+	if err := json.Unmarshal(data, rawData); err != nil {
+		return err
+	}
+	d.ResultType = rawData.ResultType.String()
+	switch rawData.ResultType {
+	case model.ValNone:
+		return nil
+	case model.ValScalar:
+		tmp := &model.Scalar{}
+		if err := json.Unmarshal(*rawData.Result, tmp); err != nil {
+			return err
+		}
+		d.Result = tmp
+	case model.ValVector:
+		tmp := model.Vector{}
+		if err := json.Unmarshal(*rawData.Result, &tmp); err != nil {
+			return err
+		}
+		d.Result = tmp
+	case model.ValMatrix:
+		tmp := model.Matrix{}
+		if err := json.Unmarshal(*rawData.Result, &tmp); err != nil {
+			return err
+		}
+		d.Result = tmp
+	case model.ValString:
+		tmp := &model.String{}
+		if err := json.Unmarshal(*rawData.Result, tmp); err != nil {
+			return err
+		}
+		d.Result = tmp
+	default:
+		return fmt.Errorf("Unknown result type: %v", d.ResultType)
+	}
+
+	return nil
+}
+
+/*
 // PrometheusVectorEnvelope represents a Vector response object from the Prometheus HTTP API
 type PrometheusVectorEnvelope struct {
 	Status string               `json:"status"`
@@ -44,14 +101,16 @@ type PrometheusMatrixData struct {
 	ResultType string       `json:"resultType"`
 	Result     model.Matrix `json:"result"`
 }
+*/
 
 // ClientRequestContext contains the objects needed to fulfull a client request
 type ClientRequestContext struct {
-	Request            *http.Request
-	Writer             http.ResponseWriter
-	CacheKey           string
-	CacheLookupResult  string
-	Matrix             PrometheusMatrixEnvelope
+	Request           *http.Request
+	Writer            http.ResponseWriter
+	CacheKey          string
+	CacheLookupResult string
+	// TODO: do we need this?
+	Matrix             PrometheusEnvelope
 	Origin             PrometheusOriginConfig
 	RequestParams      url.Values
 	RequestExtents     MatrixExtents
